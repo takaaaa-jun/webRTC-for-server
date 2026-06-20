@@ -1,4 +1,4 @@
-# webRTC-practice
+# webRTC-for-sever -webRTC-practice (forked from Kushina947/webRTC-practice)-
 
 WebRTC の実験用アプリ。
 
@@ -113,3 +113,43 @@ frontend の起動先: `http://localhost:5173/`
 - カメラ利用は `localhost` 前提
 - `Stop` で接続終了
 - 画面は `Local` と `Remote` の 2 枚
+
+## 追記（高橋）
+- 二つのPC間でやり取りする場合の接続方法
+- 現在はDHCPを使用しているので，学内でできるかは不明
+```bash
+git clone https://github.com/takaaaa-jun/webRTC-for-server # forked from Kushina947/webRTC-practice
+cd webRTC-for-server
+git switch test_webRTCconnection
+
+# backend
+cd backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+python manage.py migrate
+python manage.py runserver 0.0.0.0:8000
+
+# frontend
+cd ..
+cd frontend
+npm install
+npm run dev -- --host 0.0.0.0
+```
+
+- 最終的には，サーバを経由してアクセスできるようにする
+```txt
+カメラ用PC
+  └─ localhost でカメラ起動
+  └─ /send でサーバへ送信
+
+サーバ
+  └─ /send で受けた映像・骨格データを保持/中継
+  └─ /view で視聴者に見せる
+
+見る人のPC
+  └─ パスワード認証
+  └─ http://(IPアドレス)/view にアクセス
+  └─ 映像のみ / 骨格のみ / 同時モードを切り替え
+```
