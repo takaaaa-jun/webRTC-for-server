@@ -1,147 +1,175 @@
-import asyncio
-import threading
-from typing import Dict
+from __future__ import annotations
 
-import cv2
-import numpy as np
+import asyncio
+import copy
+import threading
+import uuid
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+
 from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc.contrib.media import MediaRelay
 from aiortc.mediastreams import VideoStreamTrack
-from av import VideoFrame
 
 
 def _start_loop() -> asyncio.AbstractEventLoop:
-    # Django の通常リクエスト処理とは別に、aiortc 用の asyncio ループを 1 つ常駐させる。
-    # こうしておくと、Django の同期 view からでも WebRTC の非同期処理を安全に動かせる。
     loop = asyncio.new_event_loop()
 
     def run() -> None:
         asyncio.set_event_loop(loop)
         loop.run_forever()
 
-    thread = threading.Thread(target=run, daemon=True)
-    thread.start()
+    threading.Thread(target=run, daemon=True).start()
     return loop
 
 
 AIORTC_LOOP = _start_loop()
+RELAY = MediaRelay()
 
 
-class GrayscaleVideoTrack(VideoStreamTrack):
-    def __init__(self, source_track: VideoStreamTrack):
-        super().__init__()
-        # 元の映像トラックを覚えておく。
-        # recv() でフレームを取り出して、加工して、返す。
-        self._source_track = source_track
+@dataclass
+class RoomState:
+    sender_session_id: Optional[str] = None
+    source_track: Optional[VideoStreamTrack] = None
+    latest_pose: Optional[Dict[str, Any]] = None
 
-    async def recv(self):
-        # 1 フレーム分の映像を source_track から受け取る。
-        frame = await self._source_track.recv()
 
-        # フレームを RGB の numpy 配列に変換する。
-        rgb_image = frame.to_ndarray(format="rgb24")
-
-        # RGB → 1チャンネルの明るさに変換してグレースケールを作る。
-        gray = np.dot(rgb_image[..., :3], [0.299, 0.587, 0.114]).astype(np.uint8)
-
-        # 1チャンネルのままだと video として扱いにくいので、3チャンネルに戻す。
-        grayscale = np.stack((gray, gray, gray), axis=-1)
-
-        # aiortc が扱える VideoFrame に戻す。
-        transformed = VideoFrame.from_ndarray(
-            cv2.cvtColor(grayscale, cv2.COLOR_RGB2BGR),
-            format="bgr24",
-        )
-        # 元フレームのタイミング情報を引き継ぐ。
-        # これがないと再生がカクついたり順番が崩れやすい。
-        transformed.pts = frame.pts
-        transformed.time_base = frame.time_base
-        return transformed
+@dataclass
+class SessionState:
+    room_id: str
+    role: str
+    pc: RTCPeerConnection
+    proxy_track: Optional[VideoStreamTrack] = None
 
 
 async def wait_for_ice_gathering_complete(pc: RTCPeerConnection) -> None:
-    # browser 側と同じく、candidate の収集が終わるまで待つ。
     while pc.iceGatheringState != "complete":
         await asyncio.sleep(0.05)
 
 
 class PeerManager:
     def __init__(self) -> None:
-        # このファイルで作った専用 event loop を使う。
         self._loop = AIORTC_LOOP
-        # session_id ごとに RTCPeerConnection を保持する。
-        self._pcs: Dict[str, RTCPeerConnection] = {}
-        # 複数スレッドから同時に触っても壊れにくくするための lock。
         self._lock = threading.Lock()
+        self._rooms: Dict[str, RoomState] = {}
+        self._sessions: Dict[str, SessionState] = {}
 
-    async def _close_async(self, session_id: str) -> None:
-        # 先に辞書から取り出してから close する。
-        # こうすると二重 close になりにくい。
+    def _get_room(self, room_id: str) -> RoomState:
         with self._lock:
-            pc = self._pcs.pop(session_id, None)
+            room = self._rooms.get(room_id)
+            if room is None:
+                room = RoomState()
+                self._rooms[room_id] = room
+            return room
 
-        if pc is not None:
-            # 接続と内部のリソースを解放する。
-            await pc.close()
+    async def _close_session_async(self, session_id: str) -> None:
+        with self._lock:
+            session = self._sessions.pop(session_id, None)
+        if session is None:
+            return
+
+        room = self._get_room(session.room_id)
+        if session.role == "send" and room.sender_session_id == session_id:
+            room.sender_session_id = None
+            room.source_track = None
+            room.latest_pose = None
+
+        await session.pc.close()
 
     def close(self, session_id: str) -> None:
         if not session_id:
             return
-
-        # Django 側から見れば同期関数でも、中では aiortc の event loop 上で閉じる。
         future = asyncio.run_coroutine_threadsafe(
-            self._close_async(session_id),
+            self._close_session_async(session_id),
             self._loop,
         )
         future.result()
 
-    async def _create_answer_async(self, session_id: str, offer: dict) -> dict:
-        # 同じ session_id が残っていたら先に消す。
-        await self._close_async(session_id)
+    async def _create_sender_answer_async(self, room_id: str, session_id: str, offer: dict) -> dict:
+        await self._close_session_async(session_id)
 
-        # backend 側の WebRTC 接続本体を作る。
         pc = RTCPeerConnection()
+        room = self._get_room(room_id)
+        session = SessionState(room_id=room_id, role="send", pc=pc)
         with self._lock:
-            self._pcs[session_id] = pc
+            self._sessions[session_id] = session
+        room.sender_session_id = session_id
 
-        # 接続状態が変わったら監視する。
-        # failed / closed / disconnected なら後片付けを始める。
-        @pc.on("connectionstatechange")
-        async def on_connectionstatechange() -> None:
-            if pc.connectionState in {"failed", "closed", "disconnected"}:
-                asyncio.create_task(self._close_async(session_id))
-
-        # browser から送られてきた track を受け取る。
-        # video track が来たら、そのままグレースケール版 track を作って返す。
         @pc.on("track")
         def on_track(track) -> None:
             if track.kind == "video":
-                pc.addTrack(GrayscaleVideoTrack(track))
+                room.source_track = track
 
-        # browser から届いた Offer を backend の RemoteDescription として登録する。
+        @pc.on("connectionstatechange")
+        async def on_connectionstatechange() -> None:
+            if pc.connectionState in {"failed", "closed", "disconnected"}:
+                await self._close_session_async(session_id)
+
         await pc.setRemoteDescription(
             RTCSessionDescription(sdp=offer["sdp"], type=offer["type"])
         )
-
-        # Offer を見て Answer を作る。
         answer = await pc.createAnswer()
-        # 自分側の Answer を LocalDescription として確定させる。
         await pc.setLocalDescription(answer)
-        # ICE candidate の収集が終わるまで待つ。
         await wait_for_ice_gathering_complete(pc)
+        return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
 
-        # browser に返す answer 用の JSON を作る。
-        return {
-            "sdp": pc.localDescription.sdp,
-            "type": pc.localDescription.type,
-        }
+    async def _create_viewer_answer_async(self, room_id: str, session_id: str, offer: dict) -> dict:
+        room = self._get_room(room_id)
+        if room.source_track is None:
+            raise RuntimeError("Source track is not ready yet.")
 
-    def create_answer(self, session_id: str, offer: dict) -> dict:
-        # Django の request handler から呼べるよう、同期関数の形に包んでいる。
+        await self._close_session_async(session_id)
+
+        pc = RTCPeerConnection()
+        session = SessionState(room_id=room_id, role="view", pc=pc)
+        with self._lock:
+            self._sessions[session_id] = session
+
+        proxy_track = RELAY.subscribe(room.source_track)
+        session.proxy_track = proxy_track
+        pc.addTrack(proxy_track)
+
+        @pc.on("connectionstatechange")
+        async def on_connectionstatechange() -> None:
+            if pc.connectionState in {"failed", "closed", "disconnected"}:
+                await self._close_session_async(session_id)
+
+        await pc.setRemoteDescription(
+            RTCSessionDescription(sdp=offer["sdp"], type=offer["type"])
+        )
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+        await wait_for_ice_gathering_complete(pc)
+        return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
+
+    def create_sender_answer(self, room_id: str, session_id: str, offer: dict) -> dict:
         future = asyncio.run_coroutine_threadsafe(
-            self._create_answer_async(session_id, offer),
+            self._create_sender_answer_async(room_id, session_id, offer),
             self._loop,
         )
         return future.result()
+
+    def create_viewer_answer(self, room_id: str, session_id: str, offer: dict) -> dict:
+        future = asyncio.run_coroutine_threadsafe(
+            self._create_viewer_answer_async(room_id, session_id, offer),
+            self._loop,
+        )
+        return future.result()
+
+    def update_pose(self, room_id: str, pose_payload: Dict[str, Any]) -> None:
+        room = self._get_room(room_id)
+        with self._lock:
+            room.latest_pose = copy.deepcopy(pose_payload)
+
+    def get_latest_pose(self, room_id: str) -> Optional[Dict[str, Any]]:
+        room = self._get_room(room_id)
+        with self._lock:
+            if room.latest_pose is None:
+                return None
+            return copy.deepcopy(room.latest_pose)
+
+    def new_session_id(self) -> str:
+        return str(uuid.uuid4())
 
 
 peer_manager = PeerManager()
